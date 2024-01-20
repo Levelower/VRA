@@ -22,7 +22,7 @@ This is the official implementation of the paper "Vision-fused Attack: Advancing
 
 ## Model
 
-Please download the following models in Huggingface:
+Please download the following models from Huggingface:
 - sentence-transformers/all-MiniLM-L6-v2
 - hgl/chinese-bert-wwm-ext
 - Helsinki-NLP/opus-mt-en-zh
