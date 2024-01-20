@@ -4,8 +4,8 @@ import pickle
 import string
 import numpy as np
 from transformers import MarianMTModel, MarianTokenizer
-from vision import vision_model
-from saliency import saliency_model
+from pixel import vision_model
+from importance import saliency_model
 from semantics import semantics_model 
 from evaluate import calc_bleu
 
@@ -16,18 +16,16 @@ class Attacker(object):
         percent='0.2', thresh=0.95, sc='all', search_method='vision',
         vision_constraint=True
     ):
-        # 从本地加载huggingface模型
         self.tokenizer_src = MarianTokenizer.from_pretrained(model_src_path)
         self.model_src = MarianMTModel.from_pretrained(model_src_path)
         self.tokenizer_tgt = MarianTokenizer.from_pretrained(model_tgt_path)
         self.model_tgt = MarianMTModel.from_pretrained(model_tgt_path)
 
-        # 将模型加载至GPU
         self.device = device
         self.model_src = self.model_src.to(self.device)
         self.model_tgt = self.model_tgt.to(self.device)
         
-        # 加载视觉相似字列表
+        # Load a list of visually similar words
         vision_file = './utils/chinese_characters/vision_similar_char_score.pkl'
         with open(vision_file, 'rb') as file:
             self.vision_similar_chars = pickle.load(file)
@@ -36,26 +34,26 @@ class Attacker(object):
         with open(radicals_file, 'rb') as file:
             self.radicals_similar_chars = pickle.load(file)
 
-        # 加载重要度计算模型
+        # Load importance calculation model
         model_saliency_path = './model/chinese-bert-wwm-ext'
         self.saliency_model = saliency_model(model_saliency_path, device=device)
 
-        # 加载视觉相似度模型
+        # Load visual similarity model
         self.vision_model = vision_model()
 
-        # 加载语义相似度计算模型
+        # Load semantic similarity calculation model
         model_semantics_path = './model/all-MiniLM-L6-v2'
         self.semantics_model = semantics_model(model_semantics_path, device=device)
 
-        # 语义搜索部分
+        # Semantic search section
         self.token_vocab = self.tokenizer_src.get_vocab()
         self.text_map = {label: text for text, label in self.token_vocab.items()}
         self.token_embeddings = self.model_src.get_input_embeddings().weight.data
 
-        # merge方法
+        # Merge criteria, the main experiment uses merge3
         self.set_merge_method(method)
 
-        # 超参
+        # Hyperparameter
         self.percent = percent
         self.thresh = thresh
         self.sc = sc
@@ -70,7 +68,7 @@ class Attacker(object):
             self.attack7
         ][method-1]
 
-    # 翻译src到tgt
+    # Translate src to tgt
     def translate_src(self, text, length=None):
         input_ids = self.tokenizer_src.encode(text, return_tensors="pt").to(self.device)
         if length is None:
@@ -81,7 +79,7 @@ class Attacker(object):
         output_text = self.tokenizer_src.decode(output[0], skip_special_tokens=True)
         return output_text
 
-    # 翻译tgt到src
+    # Translate tgt to src
     def translate_tgt(self, text, length=None):
         input_ids = self.tokenizer_tgt.encode(text, return_tensors="pt").to(self.device)
         if length is None:
@@ -91,12 +89,12 @@ class Attacker(object):
         output_text = self.tokenizer_tgt.decode(output[0], skip_special_tokens=True)
         return output_text
     
-    # 为句子中的每个token计算重要度
+    # Calculate the importance of each token in a sentence
     def get_token_importance(self, words):
         importance = self.saliency_model.scores(words)
         return importance
     
-    # 为某个token查找视觉相似的token
+    # Find visually similar tokens for a certain token
     def get_token_vision_similarity(self, text):
         candidate_char_list = []
         candidate_score_list = []
@@ -132,7 +130,8 @@ class Attacker(object):
 
         return candidate_char_list, candidate_score_list
     
-    # 为某个token查找语义相似，即余弦相似度最高的token
+    # Find semantically similar tokens for a certain token, 
+    # that is, the token with the highest cosine similarity
     def get_most_similar_topN(self, text, topn=10, thresh=0.9):
         input_token = text
 
@@ -158,31 +157,32 @@ class Attacker(object):
 
         return topn_tokens
     
-    # 计算两个句子之间的整体视觉相似程度
+    # Calculate the overall visual similarity between two sentences
     def get_sentence_vision_similarity(self, text1, text2):
         score_overall = self.vision_model.get_lpips_similarity(text1, text2)
         return score_overall
 
-    # 计算两个句子之间的整体语义相似程度
+    # Calculate the overall semantic similarity between two sentences
     def get_sentence_semantic_similarity(self, text1, text2):
         cosine_sim = self.semantics_model.get_sentence_similarity([text1, text2])
         return cosine_sim
 
-    # 视觉替换生成对抗样本
+    # Visual replacement generates adversarial samples
     def search_samples_by_vision(self, text):    
-        # tokenize结果不包含结尾标识，tokens结果有结尾标识，将其去除
+        # The token result does not contain an ending identifier, 
+        # while the tokens result has an ending identifier. Remove it
         tokens = self.tokenizer_src(text, return_tensors='pt').input_ids.numpy()[0][:-1]
         attack_res = [i.replace('▁','') for i in self.tokenizer_src.tokenize(text)]
 
-        # 计算token重要度
+        # Calculate token importance
         importance = self.get_token_importance(attack_res)
 
-        # 按重要度从高到低排序
+        # Sort by importance from highest to lowest
         token_ids = np.arange(0, tokens.shape[0])
         tokens_order = sorted(zip(importance, token_ids), reverse=True)
         tokens_order = [pair[1] for pair in tokens_order]
 
-        # 根据文本长度，按比例计算替换的次数上限
+        # Calculate the maximum number of replacements proportionally based on the length of the text
         if self.percent == '1':
             num_changed = 1
         elif self.percent == '2':
@@ -190,16 +190,17 @@ class Attacker(object):
         else:
             num_changed = round(len(text) * float(self.percent))
 
-        # 替换次数计数
+        # Replacement Count
         cnt = 0 
 
-        # 按重要度高低依次进行替换，若替换后相似度低于阈值则放弃此次替换，达到替换次数上限后停止
+        # Replace in order of importance. If the similarity after replacement is lower than the threshold, 
+        # abandon the replacement and stop after reaching the maximum number of replacements
         for token_idx in tokens_order:
             token = attack_res[token_idx]
 
             candidates, scores = self.get_token_vision_similarity(token)
             
-            # 获取替换后感知变化最小的作为对抗样本
+            # Obtain the adversarial sample with the smallest perceived change after replacement
             res = []
             if len(candidates) > 0:
                 sim_thresh = 0
@@ -208,16 +209,19 @@ class Attacker(object):
                     atk[token_idx] = candidate
                     atk_text = ''.join(atk)
 
-                    # 句子整体的相似度、替换词与原词的局部相似度，构成相似度分数
+                    # The overall similarity of the sentence, 
+                    # the local similarity between the substitute word and the original word, 
+                    # constitute the similarity score
                     sim_score = (self.get_sentence_vision_similarity(text, atk_text) + score) / 2
                     
                     res.append((candidate, sim_score))
                     sim_thresh = max(sim_thresh, sim_score)
 
-                # 得到整体相似度最高的
+                # Obtain the highest overall similarity
                 max_token = max(res, key=lambda x: x[1])[0] 
 
-                # 控制整体视觉相似度不得低于阈值，否则不替换
+                # The overall visual similarity should not be lower than the threshold, 
+                # otherwise it will not be replaced
                 if self.vision_constraint:
                     if sim_thresh > self.thresh:
                         attack_res[token_idx] = max_token
@@ -226,26 +230,27 @@ class Attacker(object):
                     attack_res[token_idx] = max_token
                     cnt = cnt + 1
 
-                # 达到替换比例则停止
+                # Stop when the replacement ratio is reached
                 if cnt >= num_changed:
                     break
 
         return (''.join(attack_res))
     
     def search_samples_by_semantics(self, text):
-        # tokenize结果不包含结尾标识，tokens结果有结尾标识，将其去除
+        # The token result does not contain an ending identifier, 
+        # while the tokens result has an ending identifier. Remove it
         tokens = self.tokenizer_src(text, return_tensors='pt').input_ids.numpy()[0][:-1]
         attack_res = [i.replace('▁','') for i in self.tokenizer_src.tokenize(text)]
 
-        # 计算token重要度
+        # Calculate token importance
         importance = self.get_token_importance(attack_res)
 
-        # 按重要度从高到低排序
+        # Sort by importance from highest to lowest
         token_ids = np.arange(0, tokens.shape[0])
         tokens_order = sorted(zip(importance, token_ids), reverse=True)
         tokens_order = [pair[1] for pair in tokens_order]
 
-        # 根据文本长度，按比例计算替换的次数上限
+        # Calculate the maximum number of replacements proportionally based on the length of the text
         if self.percent == '1':
             num_changed = 1
         elif self.percent == '2':
@@ -253,25 +258,25 @@ class Attacker(object):
         else:
             num_changed = round(len(text) * float(self.percent))
 
-        # 替换次数计数
+        # Replacement Count
         cnt = 0 
 
-        # 根据语义相似度进行替换
+        # Replace based on semantic similarity
         res_attack = [self.text_map.get(t, "") for t in tokens]
         for idx, i in enumerate(tokens_order):
-            # 标点符号不替换
+            # Do not replace punctuation marks
             context = self.text_map.get(tokens[i], "")
             if context == "" or context in string.punctuation:
                 res_attack[i] = context
                 continue
 
-            # 根据余弦相似度计算语义相似的topN
+            # Calculate the top N of semantic similarity based on cosine similarity
             candidate = self.get_most_similar_topN(context, 20, 0.8)
             if len(candidate) <= 0:
                 res_attack[i] = context
                 continue
 
-            # 找一个使得句子整体语义相似度下降最多的候选词进行替换
+            # Replace with a candidate word that reduces the overall semantic similarity of the sentence the most
             res = []
             for candi in candidate:
                 atk_tmp = [self.token_vocab[j] for j in res_attack]
@@ -280,7 +285,7 @@ class Attacker(object):
                 atk_text = atk_text.replace('▁', ' ').replace('</s>', '')
                 semantics_score = self.semantics_model.get_sentence_similarity([text, atk_text])
 
-                # 整体相似度约束
+                # Global similarity constraint
                 lpips_score = self.get_sentence_vision_similarity(text, atk_text)
                 sim_score = (lpips_score + self.get_sentence_vision_similarity(res_attack[i], candi)) / 2
 
@@ -288,7 +293,7 @@ class Attacker(object):
             
             max_token_info = min(res, key=lambda x: x[1])
 
-            # 控制整体视觉相似度不得低于阈值，否则不替换
+            # The overall visual similarity should not be lower than the threshold, otherwise it will not be replaced
             if self.vision_constraint:
                 if max_token_info[2] > self.thresh:
                     res_attack[i] = max_token_info[0]
@@ -297,29 +302,29 @@ class Attacker(object):
                 res_attack[i] = max_token_info[0]
                 cnt += 1
 
-            # 达到替换比例则停止
+            # Stop when the replacement ratio is reached
             if cnt >= num_changed:
                 break
 
         return (''.join(res_attack)).replace('▁', '').replace('</s>', '')
     
-    # 只使用视觉替换的方法进行攻击
+    # Attacks using only visual substitution methods
     def attack_by_vision(self, text):
         attack_res_vision = self.search_samples_by_vision(text)
         return attack_res_vision
 
-    # 使用视觉和语义结合的方法进行攻击
+    # Attack using a combination of visual and semantic methods
     def attack_by_semantics(self, text_src, text_tgt):
-        # 是否使用语义作为待替换样本
+        # Whether to use semantics as the sample to be replaced
         semantics_flag = False
 
-        # 设置原始样本为待替换样本
+        # Set the original sample as the sample to be replaced
         source = text_src
 
-        # 将参考译文翻译回来，得到语义相似的待替换样本
+        # Translate the reference translation back to obtain semantically similar samples to be replaced
         text_tgt_translation = self.translate_tgt(text_tgt)
 
-        # 审查语义相似的待替换样本是否满足语义相似条件
+        # Review whether semantically similar samples to be replaced meet the semantic similarity condition
         semantic_similarity = self.get_sentence_semantic_similarity(text_tgt_translation, text_src)
 
         if text_tgt_translation != text_src and semantic_similarity > 0.9:
@@ -328,12 +333,12 @@ class Attacker(object):
         else:
             return False, None
 
-        # 用待替换样本进行视觉替换得到最终的对抗样本
+        # Visual replacement using the sample to be replaced to obtain the final adversarial sample
         attack_res_semantics = self.search_samples_by_vision(source)
 
         return semantics_flag, attack_res_semantics
     
-    # 从上述两种方法的结果中挑选一份攻击性最强的
+    # Choose the most aggressive one from the results of the above two methods
     def attack1(self, text_src, text_tgt):
         vision_result = self.attack_by_vision(text_src)
         flag, semantics_result = self.attack_by_semantics(text_src, text_tgt)
@@ -355,7 +360,7 @@ class Attacker(object):
 
         return flag, adversarial_example
     
-    # 从两种对抗样本中挑选一份翻译结果和原始翻译语义相似度最低的
+    # Select the translation result with the lowest semantic similarity to the original translation from two adversarial samples
     def attack2(self, text_src, text_tgt):
         vision_result = self.attack_by_vision(text_src)
         flag, semantics_result = self.attack_by_semantics(text_src, text_tgt)
@@ -385,7 +390,7 @@ class Attacker(object):
 
         return flag, adversarial_example
     
-    # 从两种对抗样本中挑选一份翻译结果和参考翻译语义相似度最低的
+    # Select the translation result with the lowest semantic similarity to the reference translation from two adversarial samples
     def attack3(self, text_src, text_tgt):
         vision_result = self.attack_by_vision(text_src)
         flag, semantics_result = self.attack_by_semantics(text_src, text_tgt)
@@ -413,7 +418,7 @@ class Attacker(object):
 
         return flag, adversarial_example
     
-    # 从两种对抗样本中挑选一份和原始样本语义相似度最高的
+    # Select one of the two adversarial samples with the highest semantic similarity to the original sample
     def attack4(self, text_src, text_tgt):
         vision_result = self.attack_by_vision(text_src)
         flag, semantics_result = self.attack_by_semantics(text_src, text_tgt)
@@ -438,53 +443,53 @@ class Attacker(object):
 
         return flag, adversarial_example
 
-    # 只用视觉攻击
+    # Using only visual attacks
     def attack5(self, text_src, text_tgt):
         adversarial_example = self.attack_by_vision(text_src)
         return False, adversarial_example
     
-    # 只用语义攻击，但有约束，不符合约束的用视觉替换
+    # Use only semantic attacks, but with constraints, replace with visual ones that do not meet the constraints
     def attack6(self, text_src, text_tgt):
-        # 是否使用语义作为待替换样本
+        # Whether to use semantics as the sample to be replaced
         semantics_flag = False
 
-        # 设置原始样本为待替换样本
+        # Set the original sample as the sample to be replaced
         source = text_src
 
-        # 将参考译文翻译回来，得到语义相似的待替换样本
+        # Translate the reference translation back to obtain semantically similar samples to be replaced
         text_tgt_translation = self.translate_tgt(text_tgt)
 
-        # 审查语义相似的待替换样本是否满足语义相似条件
+        # Review whether semantically similar samples to be replaced meet the semantic similarity condition
         semantic_similarity = self.get_sentence_semantic_similarity(text_tgt_translation, text_src)
 
         if text_tgt_translation != text_src and semantic_similarity > 0.9:
             source = text_tgt_translation
             semantics_flag = True
 
-        # 用待替换样本进行视觉替换得到最终的对抗样本
+        # Visual replacement using the sample to be replaced to obtain the final adversarial sample
         attack_res_semantics = self.search_samples_by_vision(source)
 
         return semantics_flag, attack_res_semantics
     
-    # 只用语义攻击，但无约束
+    # Only semantic attacks, but unconstrained
     def attack7(self, text_src, text_tgt):
-        # 将参考译文翻译回来，得到语义相似的待替换样本
+        # Translate the reference translation back to obtain semantically similar samples to be replaced
         text_tgt_translation = self.translate_tgt(text_tgt)
 
         source = text_tgt_translation
         semantics_flag = True
 
-        # 用待替换样本进行视觉替换得到最终的对抗样本
+        # Visual replacement using the sample to be replaced to obtain the final adversarial sample
         attack_res_semantics = self.search_samples_by_vision(source)
 
         return semantics_flag, attack_res_semantics
     
-    # 从两种对抗样本中挑选一份翻译结果和参考翻译语义相似度最低的
+    # Select the translation result with the lowest semantic similarity to the reference translation from two adversarial samples
     def attack_by_vision_search(self, text_src, text_tgt):
         flag, adversarial_example = self.attack_method(text_src, text_tgt)
         return flag, adversarial_example
     
-    # 使用语义搜索进行攻击
+    # Attack using semantic search
     def attack_by_semantics_search(self, text):
         attack_res_semantics = self.search_samples_by_semantics(text)
         return None, attack_res_semantics
@@ -502,140 +507,13 @@ if __name__ == '__main__':
     model_src_path = './model/opus-mt-zh-en'
     model_tgt_path = './model/opus-mt-en-zh'
 
-    # 消融实验（组件消融：A单纯语义+B替换比例）
     percent='0.15'
     thresh=0.95
     sc='all'
     search_method='semantics'
     vision_constraint=False
 
-    # # 消融实验（组件消融：A单纯语义+B整体视觉约束）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='all'
-    # search_method='semantics'
-    # vision_constraint=True
-
-    # # 消融实验（组件消融：A语义&视觉+B替换比例）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=False
-
-    # # 消融实验（组件消融：A语义&视觉+B整体视觉约束）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：替换比例：1字符）
-    # percent='1'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：替换比例：2字符）
-    # percent='2'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：替换比例：10%）
-    # percent='0.1'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：替换比例：15%）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：替换比例：20%）
-    # percent='0.2'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：整体感知相似约束：0.92）
-    # percent='0.15'
-    # thresh=0.92
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：整体感知相似约束：0.93）
-    # percent='0.15'
-    # thresh=0.93
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：整体感知相似约束：0.94）
-    # percent='0.15'
-    # thresh=0.94
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：整体感知相似约束：0.95）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：整体感知相似约束：0.96）
-    # percent='0.15'
-    # thresh=0.96
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：整体感知相似约束：0.97）
-    # percent='0.15'
-    # thresh=0.97
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（超参消融：整体感知相似约束：0.98）
-    # percent='0.15'
-    # thresh=0.98
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（方法消融：单独radicals）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='all'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（方法消融：单独glyph）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='glyph'
-    # search_method='vision'
-    # vision_constraint=True
-
-    # # 消融实验（方法消融：单独radicals）
-    # percent='0.15'
-    # thresh=0.95
-    # sc='radicals'
-    # search_method='vision'
-    # vision_constraint=True
-
-    device = torch.device('cuda:1')
+    device = torch.device('cuda:0')
 
     attacker = Attacker(
         model_src_path, model_tgt_path, device, method=1,

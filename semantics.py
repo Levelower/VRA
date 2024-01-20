@@ -34,12 +34,3 @@ class semantics_model(object):
         return cosine_sim.item()
 
 
-if __name__ == '__main__':
-    model_semantics_path = './model/all-MiniLM-L6-v2'
-    device = torch.device('cuda:1')
-    model = semantics_model(model_semantics_path, device)
-
-    sentences = ['中文相似度', '中文是否相似']
-    cosine_sim = model.get_sentence_similarity(sentences)
-
-    print('相似度: ', cosine_sim)
